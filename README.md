@@ -10,6 +10,7 @@
 | HyperDoc |                                              | model    |
 | Sammlungen | https://github.com/ym-xu/awesome-document-understanding-datasets  | repo    |
 | DIVE-Doc | https://github.com/JayRay5/DIVE-Doc/blob/main/data/docvqa/utils.py  | repo    |
+| inspect-ai | https://github.com/JayRay5/DIVE-Doc  | repo    |
 
 ## Ansatz
 - [x] Demo
