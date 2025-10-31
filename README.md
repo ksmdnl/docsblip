@@ -9,6 +9,7 @@
 | DocVQA   | DocVQA: A Dataset for VQA on Document Images | dataset  |
 | HyperDoc |                                              | model    |
 | Sammlungen | https://github.com/ym-xu/awesome-document-understanding-datasets  | repo    |
+| DIVE-Doc | https://github.com/JayRay5/DIVE-Doc/blob/main/data/docvqa/utils.py  | repo    |
 
 ## Ansatz
 - [x] Demo
