@@ -38,7 +38,7 @@ class DocsBlip(LightningModule):
         self.encoder = LiltModel.from_pretrained(encoder_name)
         self.decoder = BartForConditionalGeneration.from_pretrained(decoder_name)
         self.adapter = LiLTAdapter(
-            in_dim=self.encoder.hidden_size,
+            in_dim=self.encoder.config.hidden_size,
             out_dim=self.decoder.config.d_model
         )
 
