@@ -127,9 +127,13 @@ class DocsBlip(LightningModule):
 
         self.decoder_tokenizer.padding_side = "left"
         # self.decoder_tokenizer.add_special_tokens({'pad_token': '<pad>'})
-        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.decoder_tokenizer.pad_token_id = self.decoder_tokenizer.eos_token_id
 
         self.decoder.resize_token_embeddings(len(self.decoder_tokenizer))
+        self.terminators = [
+            self.decoder_tokenizer.eos_token_id,
+            self.decoder_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        ]
 
         self.adapter = QFormerAdapter(
             d_img=self.encoder.config.hidden_size,
@@ -400,8 +404,6 @@ class DocsBlip(LightningModule):
         inputs_embeds = torch.cat([doc_emb, txt_embeds], dim=1)
         attention_mask = torch.cat([atts_opt, inputs.attention_mask], dim=1)
 
-        breakpoint()
-        print(self.decoder_tokenizer.batch_decode(inputs.input_ids))
         outputs = self.decoder.generate(
             inputs_embeds=inputs_embeds, 
             attention_mask=attention_mask,
@@ -412,6 +414,8 @@ class DocsBlip(LightningModule):
             # max_length=max_length,
             max_new_tokens=max_length,
             min_length=min_length,
+            pad_token_id=self.decoder_tokenizer.eos_token_id, 
+            eos_token_id=self.terminators,
             # eos_token_id=self.eos_token_id,
             repetition_penalty=repetition_penalty,
             length_penalty=length_penalty,
@@ -419,7 +423,6 @@ class DocsBlip(LightningModule):
         )
 
         decoded = self.decoder_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        breakpoint()
         return decoded
 
     def maybe_autocast(self, dtype=torch.float16):
