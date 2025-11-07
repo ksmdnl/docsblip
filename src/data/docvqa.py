@@ -2,6 +2,7 @@ import os
 import json
 from tqdm import tqdm
 
+import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import DataLoader
 from datasets import load_from_disk, Dataset, load_dataset
@@ -13,6 +14,9 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 from lightning import LightningDataModule
 
 from typing import Optional
+
+import logging
+logger = logging.getLogger(__name__)
 
 def subfinder(words_list, answer_list):
     matches = []
@@ -85,20 +89,23 @@ def generate_dataset(
     
     if subset_size:
         train_json['data'] = train_json['data'][:subset_size]
+
     for data in tqdm(train_json['data']):
-        local_dict = {}
         ans_json_name = os.path.join(ocr_path, data['image'].split('/')[-1].split('.')[0]) + '.json'
+
         with open(ans_json_name, 'r') as f:
             ans_json = json.load(f)
+
         answer_dict = ans_json['recognitionResults']
         question = data['question']
-        words = []
-        boxes = []
         
+        local_dict = {}
         local_dict['id'] = 'id_' + data['image'].split('/')[-1].split('.')[0]
         local_dict['question'] = question
         local_dict['answer'] = data['answers'][0]
         
+        words = []
+        boxes = []
         for obj in answer_dict:
             width, length = obj['width'], obj['height']
             lines = obj['lines']
@@ -112,11 +119,11 @@ def generate_dataset(
                     new_y1 = min([y1, y2, y3, y4])
                     new_y2 = max([y1, y2, y3, y4])
                     
-                    box_norm = normalize_box(new_x1,new_y1,new_x2,new_y2, width, length)
+                    box_norm = normalize_box(new_x1, new_y1, new_x2, new_y2, width, length)
                     assert new_x2 >= new_x1
                     assert new_y2 >= new_y1
-                    assert box_norm[2]>=box_norm[0]
-                    assert box_norm[3]>=box_norm[1]
+                    assert box_norm[2] >= box_norm[0]
+                    assert box_norm[3] >= box_norm[1]
 
                     boxes.append(box_norm)
                     
@@ -128,15 +135,23 @@ def generate_dataset(
     hf_data = Dataset.from_list(dataset_list)
     return hf_data
 
-def collate_fn(batch):
-    breakpoint()
-    pass
+from dataclasses import dataclass
 
-def Collater(object):
-    def __init__(self, encoder_tokenizer_path: str, decoder_tokenizer_path: str, max_len: int = 32):
+from typing import List
+
+@dataclass
+class BatchContainer:
+    input_ids: torch.Tensor
+    input_attention_mask: torch.Tensor
+    input_bbox: torch.Tensor
+    questions: List
+    targets: List
+    words: List
+
+class Collater(object):
+    def __init__(self, encoder_tokenizer_path: str, max_len: int = 32):
         self.max_len = max_len
         self.encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_tokenizer_path)
-        self.decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_tokenizer_path)
 
     def __call__(self, batch):
         questions = []
@@ -144,56 +159,35 @@ def Collater(object):
         boxes = []
         words = []
         for b in batch:
-            questions.append(b['questions'])
-            answers.append(b['answers'])
+            questions.append(b['question'])
+            answers.append(b['answer'])
             boxes.append(b['bbox'])
             words.append(b['words'])
 
-        encoding = self.encoder_tokenizer(
-            # questions,
-            words,
-            boxes=boxes,
-            truncation="only_second",
-            padding="max_length",
-            return_tensors='pt',
-            # return_token_type_ids=True,
+        try:
+            encoding = self.encoder_tokenizer(
+                words,
+                boxes=boxes,
+                truncation="longest_first",
+                padding="max_length",
+                return_tensors='pt',
+                # return_token_type_ids=True,
+                max_length=self.max_len,
+            )
+        except Exception as e:
+            logger.error(e)
+            breakpoint()
+        input_ids = encoding['input_ids']
+        input_attention_mask = encoding['attention_mask']
+        input_bbox = encoding['bbox']
+        return BatchContainer(
+            input_ids=input_ids,
+            input_attention_mask=input_attention_mask,
+            input_bbox=input_bbox,
+            targets=answers,
+            questions=questions,
+            words=words,
         )
-        answer_tokens = self.decoder_tokenizer(
-            answers,
-            padding=True,
-            truncation='longest_first',
-            return_tensors='pt',
-            max_length=self.max_length,
-            padding_side='left',
-        )
-
-class DocVQA(TorchDataset):
-    def __init__(
-        self,
-        # image_dir: str,
-        annotation_path: str,
-        ocr_path: str,
-        doc_tokenizer_path: str = "SCUT-DLVCLab/lilt-roberta-en-base",
-        # doc_tokenizer_path: str = "nielsr/lilt-xlm-roberta-base"
-        text_tokenizer_path: str = "facebook/bart-base",
-        subset_size: int = None,
-        max_len: int = 32,
-):
-        super().__init__()
-
-        # self.image_dir = image_dir
-        self.dataset = generate_dataset(
-            annotation_path=annotation_path,
-            ocr_path=ocr_path,
-            subset_size=subset_size,
-        )
-        
-    def __len__(self):
-        return len(self.dataset)
-        
-    def __getitem__(self, idx):
-        sample = self.dataset[idx]
-        return sample
 
 class VQADatamodule(LightningDataModule):
     def __init__(
@@ -202,12 +196,16 @@ class VQADatamodule(LightningDataModule):
         val_annotation_path: str,
         ocr_path: str,
         subset_size: int = None,
-        batch_size: int = 64,
+        batch_size: int = 2,
         num_workers: int = 0,
-        pin_memory: bool = False,
+        pin_memory: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.collate_fn = Collater(
+            encoder_tokenizer_path="SCUT-DLVCLab/lilt-roberta-en-base",
+            max_len=32,
+        )
     
     def setup(self, stage: Optional[str] = None) -> None:
         if stage in ("fit", None):
@@ -219,6 +217,7 @@ class VQADatamodule(LightningDataModule):
             self.val_set = generate_dataset(
                 annotation_path=self.hparams.val_annotation_path,
                 ocr_path=self.hparams.ocr_path,
+                subset_size=self.hparams.subset_size,
             )
     
     def train_dataloader(self):
@@ -227,6 +226,7 @@ class VQADatamodule(LightningDataModule):
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def val_dataloader(self):
@@ -235,10 +235,11 @@ class VQADatamodule(LightningDataModule):
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
 if __name__ == "__main__":
-    dataset = DocVQA(
+    dataset = generate_dataset(
         annotation_path="data/spdocvqa_qas/train_v1.0_withQT.json",
         ocr_path="data/ocr",
         subset_size=100,
@@ -258,11 +259,16 @@ if __name__ == "__main__":
     # encoded_train_dataset = dataset.map(
     #     encode_dataset, fn_kwargs=fn_kwargs, batched=True, batch_size=2, remove_columns=dataset.column_names
     # )
+    collater = Collater(
+        "SCUT-DLVCLab/lilt-roberta-en-base",
+        "facebook/bart-base",
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=2,
         num_workers=0,
-        collate_fn=collate_fn,
+        # collate_fn=collate_fn,
+        collate_fn=collater,
     )
     sample = next(iter(dataloader))
     breakpoint()

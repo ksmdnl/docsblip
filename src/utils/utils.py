@@ -4,6 +4,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from omegaconf import DictConfig
 
+import torch
+
 from src.utils import pylogger, rich_utils
 
 log = pylogger.RankedLogger(__name__, rank_zero_only=True)
@@ -117,3 +119,10 @@ def get_metric_value(metric_dict: Dict[str, Any], metric_name: Optional[str]) ->
     log.info(f"Retrieved metric value! <{metric_name}={metric_value}>")
 
     return metric_value
+
+def set_matmul_precision(precision: str):
+    if torch.cuda.is_available() and precision is not None:
+        device_name = torch.cuda.get_device_name(0)
+        if "T1000" in device_name:
+            torch.set_float32_matmul_precision(precision)
+            print(f"Set float32 matmul precision to {precision} for {device_name}")

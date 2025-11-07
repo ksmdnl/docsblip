@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - override /model: docsblip
+  - override /logger: wandb
+
+tags: ["docsblip", "DocVQA"]
+
+seed: 313
+
+trainer:
+  min_epochs: 1
+  max_epochs: 2
+  num_nodes: 1
+  log_every_n_steps: 2
+
+callbacks:
+  early_stopping: null
+  model_checkpoint:
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}"
+    save_last: True
+    auto_insert_metric_name: True
+    every_n_epochs: 50
+    save_on_train_epoch_end: True
+  model_summary:
+    max_depth: 1
+
+task_name: "docsblip_vqa"
+
+test: False

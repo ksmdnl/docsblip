@@ -34,6 +34,7 @@ from src.utils import (
     instantiate_loggers,
     log_hyperparameters,
     task_wrapper,
+    set_matmul_precision,
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -53,6 +54,10 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
+
+    # set matmul precision if needed
+    if cfg.get("matmul_precision"):
+        set_matmul_precision(cfg.matmul_precision)
 
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)

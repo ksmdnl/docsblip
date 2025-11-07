@@ -26,3 +26,6 @@ pytest          # tests
 ipykernel
 dataset
 transformers
+bitsandbytes
+sentencepiece
+wandb

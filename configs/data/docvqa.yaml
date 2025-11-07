@@ -1,0 +1,4 @@
+_target_: src.data.docvqa.VQADatamodule
+train_annotation_path: data/spdocvqa_qas/train_v1.0_withQT.json
+val_annotation_path: data/spdocvqa_qas/val_v1.0_withQT.json
+ocr_path: data/ocr
