@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 from datasets import load_from_disk, Dataset, load_dataset
 
 from transformers import AutoTokenizer, LayoutLMv3FeatureExtractor, LayoutLMv3Processor, LayoutLMv3TokenizerFast, LiltModel
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# import pytesseract
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 from lightning import LightningDataModule
 
