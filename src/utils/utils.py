@@ -123,6 +123,6 @@ def get_metric_value(metric_dict: Dict[str, Any], metric_name: Optional[str]) ->
 def set_matmul_precision(precision: str):
     if torch.cuda.is_available() and precision is not None:
         device_name = torch.cuda.get_device_name(0)
-        if "T1000" in device_name:
+        if "A100" in device_name or "A40" in device_name or "H100" in device_name or "T1000" in device_name:
             torch.set_float32_matmul_precision(precision)
             print(f"Set float32 matmul precision to {precision} for {device_name}")
