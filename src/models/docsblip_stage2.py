@@ -1,5 +1,11 @@
+import os
+import yaml
+from pathlib import Path
+
 from typing import Any, Dict, Tuple
 import contextlib
+
+import hydra
 
 import numpy as np
 
@@ -17,75 +23,13 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from src.models.optim import ClipLoss
 from src.utils.schedulers import WarmupCosineSchedule
 from src.utils.caption_eval.custom_caption_eval import calculate_metrics
+from src.models.blip_base import init_Qformer, init_tokenizer
+from src.models.docsblip import generate_closed_instr
 
+import logging
+logger = logging.getLogger(__name__)
 
 from typing import List
-
-def generate_closed_instr(instr):
-    return "[INST] " + instr + " [/INST]"
-
-class LiLTAdapter(torch.nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.proj = torch.nn.Linear(in_dim, out_dim)
-        # optional layernorm / dropout
-        self.ln = torch.nn.LayerNorm(out_dim)
-
-    def forward(self, x):
-        return self.ln(self.proj(x))
-
-class LiLTEncoder(nn.Module):
-    def __init__(self, pretrained_path):
-        super().__init__()
-        self.hidden_size = 768
-        self.model = LiltModel.from_pretrained(pretrained_path)
-
-    def forward(self, images, boxes, texts):
-        # expected to return (batch, seq_len, hidden_size)
-        outputs = self.model(images=images, boxes=boxes, texts=texts)
-        return outputs.last_hidden_state
-
-class QFormerAdapter(nn.Module):
-    def __init__(
-        self, 
-        num_queries=32, 
-        d_img=768,
-        d_llm=4096,
-        num_layers=4, 
-        num_heads=8, 
-        ff_dim=768,
-    ):
-        super().__init__()
-
-        self.query_embeds = nn.Parameter(
-            torch.zeros(num_queries, d_img)
-        )
-        self.query_embeds.data.normal_(mean=0.0, std=0.02)
-
-        self.llm_proj = nn.Linear(d_img, d_llm)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            # d_model=d_llm,
-            d_model=d_img,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            batch_first=True,
-            dropout=0.1,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-    def forward(self, img_emb):
-        B = img_emb.size(0)
-
-        queries = self.query_embeds.unsqueeze(0).expand(B, -1, -1)
-
-        x = torch.cat([queries, img_emb], dim=1)
-
-        out = self.transformer(x)
-        out = self.llm_proj(out)
-
-        return out[:, :queries.size(1), :]
-
 
 class DocsBlip(LightningModule):
     def __init__(
@@ -107,14 +51,29 @@ class DocsBlip(LightningModule):
         length_penalty: int = 1,
         top_p: float = 0.9,
         temperature: float = 1.0,
-    ) -> None:
+        num_query: int = 32,
+        cross_att_freq: int = 2,
+        ckpt_path: str = None,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        self.encoder = LiltModel.from_pretrained(encoder_name)
+
+        model = self._init_model(ckpt_path)
+        self.encoder = model.encoder
+        self.query_tokens = model.query_tokens
+        self.tokenizer = model.tokenizer
+
+        self.Qformer = model.Qformer
+        self.Qformer.cls = None
+        self.Qformer.bert.embeddings.word_embeddings = None
+        self.Qformer.bert.embeddings.position_embeddings = None
+        for layer in self.Qformer.bert.encoder.layer:
+            layer.output = None
+            layer.intermediate = None
+
         self.decoder = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             dtype=torch.float16,
-            # load_in_8bit=True,
         )
         self.decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name, truncation_side='left', use_fast=False)
         for n, p in self.encoder.named_parameters():
@@ -125,7 +84,6 @@ class DocsBlip(LightningModule):
         self.decoder.eval()
 
         self.decoder_tokenizer.padding_side = "left"
-        # self.decoder_tokenizer.add_special_tokens({'pad_token': '<pad>'})
         self.decoder_tokenizer.pad_token_id = self.decoder_tokenizer.eos_token_id
 
         self.decoder.resize_token_embeddings(len(self.decoder_tokenizer))
@@ -133,15 +91,27 @@ class DocsBlip(LightningModule):
             self.decoder_tokenizer.eos_token_id,
             self.decoder_tokenizer.convert_tokens_to_ids("<|eot_id|>")
         ]
-
-        self.adapter = QFormerAdapter(
-            d_img=self.encoder.config.hidden_size,
-            d_llm=self.decoder.config.hidden_size,
-            num_layers=8,
-            num_heads=8,
+        self.decoder_proj = nn.Linear(
+            self.Qformer.config.hidden_size, self.decoder.config.hidden_size
         )
-        self.clip_loss = ClipLoss()
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def _init_model(self, ckpt_path) -> torch.nn.Module:
+        config_path = os.path.join(ckpt_path, '.hydra/config.yaml')
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.load(f, Loader=yaml.SafeLoader)
+        model = hydra.utils.instantiate(config['model'])
+        model_name = self.hparams.ckpt_path.split('/')[-1]
+        logger.info(f'Loading pretrained model: {model_name}')
+        pathlist = Path(self.hparams.ckpt_path).glob('**/*.ckpt')
+        filelist = [str(file) for file in pathlist]
+        weight_path = filelist[0]
+        ckpt = torch.load(weight_path, weights_only=False, map_location='cpu')
+        weight = ckpt['state_dict']
+        for n, p in model.named_parameters():
+            p.data.copy_(weight[n].data)
+            p.requires_grad = False
+        model.eval()
+        return model
 
     def encode_doc(self):
         pass
@@ -176,48 +146,22 @@ class DocsBlip(LightningModule):
         queries: List,
         targets: List,
     ) -> torch.Tensor:
-        self.decoder_tokenizer.padding_side = "right"
         bs = input_ids.shape[0]
+        device = input_ids.device
+
         with self.maybe_autocast():
             doc_emb = self.encoder(input_ids=input_ids, bbox=input_bbox, attention_mask=input_attention_mask).last_hidden_state
             doc_emb = F.normalize(doc_emb, dim=-1)
         
-        doc_emb = self.adapter(doc_emb)
-
-        target_tokens = self.decoder_tokenizer(
-            targets,
-            return_tensors='pt',
-            padding='longest',
-            truncation=True,
-            max_length=self.hparams.max_len,
-        ).to(input_ids.device)
-
-        with self.maybe_autocast():
-            outputs = self.decoder.model(
-                input_ids=target_tokens.input_ids,
-                attention_mask=target_tokens.attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-        ans_emb = outputs.last_hidden_state[:, 0, :]
-
-        mask = input_attention_mask.unsqueeze(-1).float()  # (B, seq_len, 1)
-        masked_doc_emb = (doc_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
-        proj_emb = F.normalize(masked_doc_emb, dim=-1)
-
-        # pooled_doc_emb = doc_emb.mean(dim=1)
-        # proj_emb = F.normalize(pooled_doc_emb, dim=-1)
-
-        mask = target_tokens.attention_mask.unsqueeze(-1)
-        ans_emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
-        ans_emb = F.normalize(ans_emb, dim=-1)
-
-        # ans_emb = F.normalize(ans_emb, dim=-1)
-        contrastive_loss = self.clip_loss(proj_emb, ans_emb, self.logit_scale.exp())
-
-        cos_sim = (proj_emb * ans_emb).sum(dim=-1).mean()
-        print(f"Contrastive loss: {contrastive_loss.item():.3f} | Avg cos sim: {cos_sim.item():.3f}")
+        query_tokens = self.query_tokens.expand(doc_emb.shape[0], -1, -1)
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=doc_emb,
+            encoder_attention_mask=input_attention_mask,
+            return_dict=True,
+        )
+        inputs_lm = self.decoder_proj(query_output.last_hidden_state)
+        atts_lm = torch.ones(inputs_lm.size()[:-1], dtype=torch.long).to(device)
 
         self.decoder_tokenizer.padding_side = "right"
         self.decoder_tokenizer.truncation_side = "left"
@@ -262,9 +206,8 @@ class DocsBlip(LightningModule):
 
         with self.maybe_autocast():
             inputs_embeds = self.decoder.get_input_embeddings()(llm_tokens['input_ids'])
-            inputs_embeds = torch.cat([doc_emb, inputs_embeds], dim=1)
-            decoder_att = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(doc_emb.device)
-            attention_mask = torch.cat([decoder_att, llm_tokens['attention_mask']], dim=1)
+            inputs_embeds = torch.cat([inputs_lm, inputs_embeds], dim=1)
+            attention_mask = torch.cat([atts_lm, llm_tokens['attention_mask']], dim=1)
             outputs = self.decoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -273,13 +216,7 @@ class DocsBlip(LightningModule):
             )
             
         lm_loss = outputs.loss
-        loss = self.hparams.alpha * contrastive_loss + (1 - self.hparams.alpha) * lm_loss
-        return {
-            "loss": loss,
-            "contrastive_loss": contrastive_loss,
-            "lm_loss": lm_loss,
-            "cos_sim": cos_sim,
-        }
+        return {"loss": lm_loss}
 
     def concat_text_input_output(self, input_ids, input_atts, output_ids, output_atts):
         input_part_targets_len = []
@@ -304,27 +241,6 @@ class DocsBlip(LightningModule):
         llm_tokens['input_ids'] = torch.stack(llm_tokens['input_ids'])
         llm_tokens['attention_mask'] = torch.stack(llm_tokens['attention_mask'])
         return llm_tokens, input_part_targets_len
-
-    def _get_param_groups(self):
-        return [
-            {
-                "params": (
-                    p
-                    for n, p in self.adapter.named_parameters()
-                    if ("bias" not in n) and (len(p.shape) != 1)
-                )
-            },
-            {
-                "params": (
-                    p
-                    for n, p in self.adapter.named_parameters()
-                    if ("bias" in n) or (len(p.shape) == 1)
-                ),
-                "WD_exclude": True,
-                "weight_decay": 0,
-            },
-            {'params': self.logit_scale, 'WD_exclude': True, 'weight_decay': 0},
-        ]
 
     def configure_optimizers(self):
         iterations_per_epoch = self.trainer.num_training_batches
@@ -354,6 +270,15 @@ class DocsBlip(LightningModule):
                 "interval": "step",
             },
         }
+
+    def maybe_autocast(self, dtype=torch.float16):
+        enable_autocast = self.device != torch.device("cpu")
+
+        if enable_autocast:
+            return torch.amp.autocast(device_type=self.device.type, dtype=dtype)
+        else:
+            return contextlib.nullcontext()
+
     def on_validation_start(self):
         self.answer_results = {'annotations': []}
         self.answer_gts = {'annotations': []}
@@ -390,7 +315,7 @@ class DocsBlip(LightningModule):
         batch,
         use_nucleus_sampling=False,
         num_beams=5,
-        max_length=512,
+        max_length=16,
         min_length=1,
         top_p=0.9,
         repetition_penalty=1.5,
@@ -399,14 +324,24 @@ class DocsBlip(LightningModule):
     ):
         device = batch.input_ids.device
         self.decoder_tokenizer.padding_side = "left"
-        doc_emb = self.encoder(
-            batch.input_ids, bbox=batch.input_bbox, attention_mask=batch.input_attention_mask,
-        ).last_hidden_state
+        with self.maybe_autocast():
+            doc_emb = self.encoder(
+                batch.input_ids, bbox=batch.input_bbox, attention_mask=batch.input_attention_mask,
+            ).last_hidden_state
+
+        doc_atts = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(device)
 
         doc_emb = F.normalize(doc_emb, dim=-1)
 
-        doc_emb = self.adapter(doc_emb)
-        atts_opt = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(device)
+        query_tokens = self.query_tokens.expand(doc_emb.shape[0], -1, -1)
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=doc_emb,
+            encoder_attention_mask=doc_atts,
+            return_dict=True,
+        )
+        inputs_lm = self.decoder_proj(query_output.last_hidden_state)
+        atts_lm = torch.ones(inputs_lm.size()[:-1], dtype=torch.long).to(device)
 
         # Tokenize prompt
         inputs = self.decoder_tokenizer(
@@ -417,38 +352,69 @@ class DocsBlip(LightningModule):
             max_length=32,
         ).to(device)
 
-        txt_embeds = self.decoder.get_input_embeddings()(inputs.input_ids)
-        inputs_embeds = torch.cat([doc_emb, txt_embeds], dim=1)
-        attention_mask = torch.cat([atts_opt, inputs.attention_mask], dim=1)
+        with self.maybe_autocast():
+            txt_embeds = self.decoder.get_input_embeddings()(inputs.input_ids)
 
-        outputs = self.decoder.generate(
-            inputs_embeds=inputs_embeds, 
-            attention_mask=attention_mask,
-            do_sample=use_nucleus_sampling,
-            top_p=top_p,
-            temperature=temperature,
-            num_beams=num_beams,
-            # max_length=max_length,
-            max_new_tokens=max_length,
-            min_length=min_length,
-            pad_token_id=self.decoder_tokenizer.eos_token_id, 
-            eos_token_id=self.terminators,
-            # eos_token_id=self.eos_token_id,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            num_return_sequences=1,
-        )
+            inputs_embeds = torch.cat([inputs_lm, txt_embeds], dim=1)
+            attention_mask = torch.cat([atts_lm, inputs.attention_mask], dim=1)
+
+            outputs = self.decoder.generate(
+                inputs_embeds=inputs_embeds, 
+                attention_mask=attention_mask,
+                do_sample=use_nucleus_sampling,
+                top_p=top_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                # max_length=max_length,
+                max_new_tokens=max_length,
+                min_length=min_length,
+                pad_token_id=self.decoder_tokenizer.eos_token_id, 
+                eos_token_id=self.terminators,
+                # eos_token_id=self.eos_token_id,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                num_return_sequences=1,
+            )
 
         decoded = self.decoder_tokenizer.batch_decode(outputs, skip_special_tokens=True)
         return decoded
 
-    def maybe_autocast(self, dtype=torch.float16):
-        enable_autocast = self.device != torch.device("cpu")
-
-        if enable_autocast:
-            return torch.amp.autocast(device_type=self.device.type, dtype=dtype)
-        else:
-            return contextlib.nullcontext()
+    def _get_param_groups(self):
+        return [
+            {
+                "params": (
+                    p
+                    for n, p in self.Qformer.named_parameters()
+                    if ("bias" not in n) and (len(p.shape) != 1)
+                )
+            },
+            {
+                "params": (
+                    p
+                    for n, p in self.Qformer.named_parameters()
+                    if ("bias" in n) or (len(p.shape) == 1)
+                ),
+                "WD_exclude": True,
+                "weight_decay": 0,
+            },
+            {'params': self.query_tokens, 'WD_exclude': True, 'weight_decay': 0},
+            {
+                "params": (
+                    p
+                    for n, p in self.decoder_proj.named_parameters()
+                    if ("bias" not in n) and (len(p.shape) != 1)
+                )
+            },
+            {
+                "params": (
+                    p
+                    for n, p in self.decoder_proj.named_parameters()
+                    if ("bias" in n) or (len(p.shape) == 1)
+                ),
+                "WD_exclude": True,
+                "weight_decay": 0,
+            },
+        ]
 
     def on_save_checkpoint(self, checkpoint):
         state_dict = {}
