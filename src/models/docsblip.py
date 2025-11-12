@@ -17,12 +17,9 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from src.models.optim import ClipLoss
 from src.utils.schedulers import WarmupCosineSchedule
 from src.utils.caption_eval.custom_caption_eval import calculate_metrics
-
+from src.models.utils import *
 
 from typing import List
-
-def generate_closed_instr(instr):
-    return "[INST] " + instr + " [/INST]"
 
 class LiLTAdapter(torch.nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -200,20 +197,14 @@ class DocsBlip(LightningModule):
                 return_dict=True,
             )
 
-        ans_emb = outputs.last_hidden_state[:, 0, :]
-
         mask = input_attention_mask.unsqueeze(-1).float()  # (B, seq_len, 1)
         masked_doc_emb = (doc_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
         proj_emb = F.normalize(masked_doc_emb, dim=-1)
-
-        # pooled_doc_emb = doc_emb.mean(dim=1)
-        # proj_emb = F.normalize(pooled_doc_emb, dim=-1)
 
         mask = target_tokens.attention_mask.unsqueeze(-1)
         ans_emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
         ans_emb = F.normalize(ans_emb, dim=-1)
 
-        # ans_emb = F.normalize(ans_emb, dim=-1)
         contrastive_loss = self.clip_loss(proj_emb, ans_emb, self.logit_scale.exp())
 
         cos_sim = (proj_emb * ans_emb).sum(dim=-1).mean()
@@ -221,13 +212,25 @@ class DocsBlip(LightningModule):
 
         self.decoder_tokenizer.padding_side = "right"
         self.decoder_tokenizer.truncation_side = "left"
-        text_input_tokens = self.decoder_tokenizer(
-            [generate_closed_instr(q) for q in queries],
-            return_tensors="pt",
-            padding="longest",
+        dialog_template = to_dialog_template(queries)
+        text_input_tokens = self.decoder_tokenizer.apply_chat_template(
+            dialog_template,
+            tokenize=True,
+            return_tensors='pt',
+            padding='longest',
             truncation=True,
             max_length=self.hparams.max_len,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
         ).to(input_ids.device)
+        # text_input_tokens = self.decoder_tokenizer(
+        #     [generate_closed_instr(q) for q in queries],
+        #     return_tensors="pt",
+        #     padding="longest",
+        #     truncation=True,
+        #     max_length=self.hparams.max_len,
+        # ).to(input_ids.device)
+
 
         self.decoder_tokenizer.truncation_side = "right"
         text_output_tokens = self.decoder_tokenizer(
@@ -239,8 +242,8 @@ class DocsBlip(LightningModule):
         ).to(input_ids.device)
 
         llm_tokens, input_part_targets_len = self.concat_text_input_output(
-            text_input_tokens.input_ids,
-            text_input_tokens.attention_mask,
+            text_input_tokens['input_ids'],
+            text_input_tokens['attention_mask'],
             text_output_tokens.input_ids,
             text_output_tokens.attention_mask,
         )
@@ -262,9 +265,12 @@ class DocsBlip(LightningModule):
 
         with self.maybe_autocast():
             inputs_embeds = self.decoder.get_input_embeddings()(llm_tokens['input_ids'])
-            inputs_embeds = torch.cat([doc_emb, inputs_embeds], dim=1)
+            # inputs_embeds = torch.cat([doc_emb, inputs_embeds], dim=1)
+            inputs_embeds = torch.cat([inputs_embeds[:, :1], doc_emb, inputs_embeds[:, 1:]], dim=1)
+
             decoder_att = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(doc_emb.device)
-            attention_mask = torch.cat([decoder_att, llm_tokens['attention_mask']], dim=1)
+            # attention_mask = torch.cat([decoder_att, llm_tokens['attention_mask']], dim=1)
+            attention_mask = torch.cat([llm_tokens['attention_mask'][:, :1], decoder_att, llm_tokens['attention_mask'][:, 1:]], dim=1)
             outputs = self.decoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -398,6 +404,7 @@ class DocsBlip(LightningModule):
         temperature=1,
     ):
         device = batch.input_ids.device
+        bs = batch.input_ids.shape[0]
         self.decoder_tokenizer.padding_side = "left"
         doc_emb = self.encoder(
             batch.input_ids, bbox=batch.input_bbox, attention_mask=batch.input_attention_mask,
@@ -409,17 +416,45 @@ class DocsBlip(LightningModule):
         atts_opt = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(device)
 
         # Tokenize prompt
-        inputs = self.decoder_tokenizer(
-            [generate_closed_instr(q) for q in batch.questions],
+        # inputs = self.decoder_tokenizer(
+        #     [generate_closed_instr(q) for q in batch.questions],
+        #     return_tensors='pt',
+        #     padding='longest',
+        #     truncation=True,
+        #     max_length=32,
+        # ).to(device)
+        dialog_template = to_dialog_template(batch.questions)
+        inputs = self.decoder_tokenizer.apply_chat_template(
+            dialog_template,
+            tokenize=True,
             return_tensors='pt',
             padding='longest',
             truncation=True,
-            max_length=32,
+            max_length=self.hparams.max_len,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
         ).to(device)
+        bos_mask = (inputs.input_ids == self.decoder_tokenizer.bos_token_id)
+        bos_positions = bos_mask.int().argmax(dim=1)
 
         txt_embeds = self.decoder.get_input_embeddings()(inputs.input_ids)
         inputs_embeds = torch.cat([doc_emb, txt_embeds], dim=1)
         attention_mask = torch.cat([atts_opt, inputs.attention_mask], dim=1)
+
+        inputs_embeds = []
+        inputs_att_mask = []
+        for i in range(bs):
+            bos_pos = bos_positions[i].item()
+            before = txt_embeds[i, :bos_pos+1, :]
+            after = txt_embeds[i, bos_pos+1:, :]
+            inputs_embeds.append(torch.cat([before, doc_emb[i], after], dim=0))
+
+            mask_before = inputs.attention_mask[i, :bos_pos+1]
+            mask_after = inputs.attention_mask[i, bos_pos+1:]
+            inputs_att_mask.append(torch.cat([mask_before, atts_opt[i], mask_after], dim=0))
+
+        inputs_embeds = torch.stack(inputs_embeds)
+        attention_mask = torch.stack(inputs_att_mask)
 
         outputs = self.decoder.generate(
             inputs_embeds=inputs_embeds, 

@@ -4,8 +4,8 @@ decoder_name: meta-llama/Llama-2-7b-chat-hf
 max_len: 32
 start_lr: 1e-8
 ref_lr: 1e-5
-final_lr: 0
+final_lr: 1e-5
 ref_wd: 0.04
 final_wd: 0.4
 dropout: 0.1
-warmup_steps: 10
+warmup_steps: 2000

@@ -71,7 +71,6 @@ class DocsBlip(LightningModule):
         self.itm_head = nn.Linear(self.Qformer.config.hidden_size, 2)
 
         self.temp = nn.Parameter(0.07 * torch.ones([]))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def encode_doc(self):
         pass
@@ -370,7 +369,6 @@ class DocsBlip(LightningModule):
                 "WD_exclude": True,
                 "weight_decay": 0,
             },
-            {'params': self.logit_scale, 'WD_exclude': True, 'weight_decay': 0},
             {'params': self.query_tokens, 'WD_exclude': True, 'weight_decay': 0},
         ]
 
