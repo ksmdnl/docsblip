@@ -32,5 +32,4 @@ python src/train.py \
     task_name=${task_name} \
     +logger.wandb.name=${task_name} \
     logger.wandb.tags=${tags} \
-    +logger.wandb.name=docsblip\
-    logger.wandb.tags=${tags}\
+    logger.wandb.name=docsblip\

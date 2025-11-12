@@ -67,7 +67,7 @@ class DocsBlip(LightningModule):
 
         self.decoder = AutoModelForCausalLM.from_pretrained(
             decoder_name,
-            dtype=torch.float16,
+            # dtype=torch.float16,
         )
         self.decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name, truncation_side='left', use_fast=False)
         for n, p in self.encoder.named_parameters():
@@ -328,6 +328,100 @@ class DocsBlip(LightningModule):
         self.answer_results["annotations"].clear()
         self.decoder_tokenizer.padding_side = "right"
         self.decoder_tokenizer.truncation_side = "left"
+
+    @torch.no_grad()
+    def generate_answer(self,
+        batch,
+        use_nucleus_sampling=False,
+        num_beams=5,
+        max_length=16,
+        min_length=1,
+        top_p=0.9,
+        repetition_penalty=1.2,
+        length_penalty=1,
+        temperature=1,
+    ):
+        bs = batch.input_ids.shape[0]
+        device = batch.input_ids.device
+        doc_emb = self.encoder(
+            batch.input_ids, bbox=batch.input_bbox, attention_mask=batch.input_attention_mask,
+        ).last_hidden_state
+        doc_emb = F.normalize(doc_emb, dim=-1)
+        doc_atts = torch.ones(doc_emb.size()[:-1], dtype=torch.long).to(device)
+
+        query_tokens = self.query_tokens.expand(doc_emb.shape[0], -1, -1)
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=doc_emb,
+            encoder_attention_mask=doc_atts,
+            return_dict=True,
+        )
+        inputs_lm = self.decoder_proj(query_output.last_hidden_state)
+        atts_lm = torch.ones(inputs_lm.size()[:-1], dtype=torch.long).to(device)
+
+        # Tokenize prompt
+        dialog_template = to_dialog_template(batch.questions)
+        # inputs = self.decoder_tokenizer(
+        #     [generate_closed_instr(q) for q in batch.questions],
+        #     return_tensors='pt',
+        #     padding='longest',
+        #     truncation=True,
+        #     max_length=32,
+        # ).to(device)
+        inputs = self.decoder_tokenizer.apply_chat_template(
+            dialog_template,
+            tokenize=True,
+            return_tensors='pt',
+            padding='longest',
+            truncation=True,
+            max_length=self.hparams.max_len,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
+        ).to(device)
+        bos_mask = (inputs.input_ids == self.decoder_tokenizer.bos_token_id)
+        bos_positions = bos_mask.int().argmax(dim=1)
+
+        txt_embeds = self.decoder.get_input_embeddings()(inputs.input_ids)
+
+        # inputs_embeds = torch.cat([inputs_lm, txt_embeds], dim=1)
+        inputs_embeds = []
+        inputs_att_mask = []
+        for i in range(bs):
+            bos_pos = bos_positions[i].item()
+            before = txt_embeds[i, :bos_pos+1, :]
+            after = txt_embeds[i, bos_pos+1:, :]
+            inputs_embeds.append(torch.cat([before, inputs_lm[i], after], dim=0))
+
+            mask_before = inputs.attention_mask[i, :bos_pos+1]
+            mask_after = inputs.attention_mask[i, bos_pos+1:]
+            inputs_att_mask.append(torch.cat([mask_before, atts_lm[i], mask_after], dim=0))
+
+        inputs_embeds = torch.stack(inputs_embeds)
+        attention_mask = torch.stack(inputs_att_mask)
+
+        # inputs_embeds = torch.cat([inputs_lm, txt_embeds], dim=1)
+        # attention_mask = torch.cat([atts_lm, inputs.attention_mask], dim=1)
+
+        outputs = self.decoder.generate(
+            inputs_embeds=inputs_embeds, 
+            attention_mask=attention_mask,
+            # do_sample=use_nucleus_sampling,
+            # top_p=top_p,
+            temperature=temperature,
+            num_beams=num_beams,
+            # max_length=max_length,
+            max_new_tokens=max_length,
+            # min_length=min_length,
+            pad_token_id=self.decoder_tokenizer.eos_token_id, 
+            eos_token_id=self.terminators,
+            # eos_token_id=self.eos_token_id,
+            repetition_penalty=repetition_penalty,
+            # length_penalty=length_penalty,
+            num_return_sequences=1,
+        )
+
+        decoded = self.decoder_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        return decoded
 
     @torch.no_grad()
     def generate(self,

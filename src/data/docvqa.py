@@ -164,19 +164,15 @@ class Collater(object):
             boxes.append(b['bbox'])
             words.append(b['words'])
 
-        try:
-            encoding = self.encoder_tokenizer(
-                words,
-                boxes=boxes,
-                truncation="longest_first",
-                padding="max_length",
-                return_tensors='pt',
-                # return_token_type_ids=True,
-                max_length=self.max_len,
-            )
-        except Exception as e:
-            logger.error(e)
-            breakpoint()
+        encoding = self.encoder_tokenizer(
+            words,
+            boxes=boxes,
+            truncation="longest_first",
+            padding="max_length",
+            return_tensors='pt',
+            # return_token_type_ids=True,
+            max_length=self.max_len,
+        )
         input_ids = encoding['input_ids']
         input_attention_mask = encoding['attention_mask']
         input_bbox = encoding['bbox']
